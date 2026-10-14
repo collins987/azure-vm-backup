@@ -156,7 +156,7 @@ host-files.tar.gz
   /opt/n8n-docker-caddy           — Compose stack, .env, local_files, Caddy config
   /home/n8nuser/firecrawl         — Firecrawl source and config
   /home/n8nuser/tgbot             — Telegram bot source and config
-  /home/n8n-user/.config/rclone  — rclone credentials (if present)
+  /home/n8nuser/.config/rclone   — rclone credentials (if present)
   /etc/docker, /etc/containerd   — Docker and containerd host config
   Compose project working dirs discovered from Docker labels
   External bind-mount sources discovered from container metadata

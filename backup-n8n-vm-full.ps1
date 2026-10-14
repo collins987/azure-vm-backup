@@ -431,7 +431,7 @@ _discover_host_paths() {
     add_host_path '/opt/n8n-docker-caddy'
     add_host_path '/home/n8nuser/firecrawl'
     add_host_path '/home/n8nuser/tgbot'
-    add_host_path '/home/n8n-user/.config/rclone'
+    add_host_path '/home/n8nuser/.config/rclone'
     add_host_path '/etc/docker'
     add_host_path '/etc/containerd'
     add_host_path '/etc/systemd/system/docker.service.d'
@@ -529,20 +529,26 @@ mode_stream_host_files() {
 }
 
 # ── stream-volume: stream one Docker volume as tar.gz to stdout ───────────────
-# Hash is NOT computed here (stream_hashed+tee is unreliable when docker run is
-# in the pipeline under set -Eeuo pipefail).  The PS1 records the destination
-# hash from the received file; integrity is still verified end-to-end on Windows.
+# The archive is streamed from `docker run alpine tar -cpf - -C /source .`,
+# with gzip and the SHA-256 of the compressed byte stream computed on the VM
+# host (outside the container) via stream_hashed. This gives Windows a
+# source-side hash to compare against — closing the integrity gap present in
+# earlier revisions, which hashed only the receive-side bytes.
+#
+# GNU tar exit codes:
+#   0  success
+#   1  non-fatal warnings (e.g. a file changed while being read)
+#   2+ fatal error
+# We accept 0 and 1 so routine warnings do not abort the backup, but let 2+
+# propagate through the pipe so pipefail trips and the archive is rejected.
 mode_stream_volume() {
     local vol="$1" clevel="${2:-3}"
     docker volume inspect "$vol" >/dev/null 2>&1 || die "Volume not found: $vol"
     say "Streaming volume $vol (gzip level $clevel)..."
-    # Run docker in a subshell with -e suspended so a non-zero container exit
-    # (e.g. tar warning on special files) does not abort the SSH session.
-    ( set +e
-      docker run --rm --network none \
-          -v "${vol}:/source:ro" alpine \
-          sh -c "tar -cpf - -C /source . | gzip -${clevel}"
-    )
+    stream_hashed "$clevel" bash -c \
+        "docker run --rm --network none -v '${vol}:/source:ro' alpine \
+            sh -c 'tar -cpf - -C /source .; code=\$?; [ \$code -le 1 ] || exit \$code' \
+         | gzip -${clevel}"
 }
 
 # ── stream-images: stream all Docker images (deduplicated by ID) as tar.gz ────
@@ -936,10 +942,11 @@ try {
     $windowsChecksums | Sort-Object | Set-Content -LiteralPath $finalSumsPath -Encoding UTF8
 
     # Write BACKUP-INFO.txt
+    $createdUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $infoContent = @"
 VM FULL RESTORE POINT — DIRECT STREAMING ARCHITECTURE
 ======================================================
-Created UTC    : $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ' -AsUTC)
+Created UTC    : $createdUtc
 Backup folder  : $backupFolderName
 VM host        : $SshHost
 SSH user       : $SshUser
