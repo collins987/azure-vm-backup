@@ -5,6 +5,9 @@ Architecture: direct SSH streaming (no large staging files on VM)
 FILES
   backup-n8n-vm-full.cmd   Launch this from Windows Explorer or CMD.
   backup-n8n-vm-full.ps1   Drives the backup over SSH from Windows.
+  RESTORE.md               Step-by-step restore runbook.
+  CLAUDE.md                Context for future automated edits to this repo.
+  tests/syntax-check.sh    Static bash-syntax check of the embedded runner.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PREREQUISITES
@@ -51,6 +54,30 @@ OPTIONAL PARAMETER OVERRIDES (pass after the .cmd filename):
   backup-n8n-vm-full.cmd -SshHost 1.2.3.4 -SshUser n8nuser -BackupDir "D:\VM Backups"
   backup-n8n-vm-full.cmd -CompressLevel 1    (fastest, less compression)
   backup-n8n-vm-full.cmd -CompressLevel 6    (gzip default, slower)
+
+MODES
+  -DryRun
+      Discovery pass only. Connects to the VM, installs the disposable SSH
+      key, uploads the runner, calls the read-only get-info to list
+      volumes/images/sizes, prints the plan, and exits WITHOUT stopping any
+      container or streaming any archive. The uploaded runner is removed
+      and the SSH key is torn down exactly as in a live run. Safe to run
+      any time — nothing changes on the VM or on Windows.
+
+  -ValidateBackup "C:\path\to\VM-Restore-Point-20261014-100000"
+      Offline validation of an existing backup folder. Does NOT connect to
+      the VM. Rehashes every file against SHA256SUMS, re-runs tar.gz /
+      pg_dumpall structure checks, and verifies manifest.json's artifact
+      list. Returns exit 0 on pass, non-zero on any failure. Use before a
+      restore and periodically after taking a backup.
+
+OUTPUT: manifest.json
+  Each successful backup now writes manifest.json alongside BACKUP-INFO.txt.
+  It is the machine-readable record of what the backup contains:
+  schemaVersion, backupId, createdUtc, source identity, per-artifact
+  size + source/dest SHA-256 + verified flag, volume inventory, image
+  count, stopped container IDs, and a verification block. -ValidateBackup
+  reads this file.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEFAULTS
