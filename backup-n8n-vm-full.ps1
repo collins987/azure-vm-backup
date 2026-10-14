@@ -3,7 +3,19 @@ param(
     [string]$SshHost     = '102.133.184.146',
     [string]$SshUser     = 'n8nuser',
     [string]$BackupDir   = (Join-Path $env:USERPROFILE 'Desktop\New folder\Azure n8n Configs'),
-    [ValidateRange(1,9)][int]$CompressLevel = 3
+    [ValidateRange(1,9)][int]$CompressLevel = 3,
+
+    # Discovery-only pass: connects to the VM, inventories what WOULD be
+    # captured, prints the plan, then exits without stopping containers or
+    # streaming any archives. The disposable SSH key and the remote runner
+    # script are installed and removed exactly as in a normal run.
+    [switch]$DryRun,
+
+    # Offline validation of an existing backup folder. Takes a path to a
+    # VM-Restore-Point-YYYYMMDD-HHmmss directory. Does NOT connect to the VM.
+    # Re-hashes every file against SHA256SUMS, re-runs tar.gz structure checks,
+    # and validates PostgreSQL dumps and manifest.json where present.
+    [string]$ValidateBackup
 )
 
 Set-StrictMode -Version Latest
@@ -385,10 +397,11 @@ mode_prepare() {
 }
 
 # ── get-info: output machine-parseable info lines for Windows ─────────────────
+# Read-only inventory. Does not require the staging dir to exist, so it can be
+# called in dry-run mode (before prepare) and after prepare in a live run.
 mode_get_info() {
     local folder_name="$1"
     BACKUP_DIR="$HOME/$folder_name"
-    [[ -d "$BACKUP_DIR" ]] || die "Staging directory not found: $BACKUP_DIR"
 
     # Volumes
     local -a vnames=()
@@ -678,24 +691,155 @@ $normalized = $remoteScript -replace "`r`n", "`n" -replace "`r", "`n"
 [System.IO.File]::WriteAllText($tempScript, $normalized, $utf8NoBom)
 
 # ─── SHA256SUMS accumulator (Windows-side) ────────────────────────────────────
-$windowsChecksums = [System.Collections.Generic.List[string]]::new()
+$windowsChecksums   = [System.Collections.Generic.List[string]]::new()
+# ─── Manifest accumulator (populated as artifacts stream) ─────────────────────
+$manifestArtifacts  = [System.Collections.Generic.List[hashtable]]::new()
+
+# ─── Offline validation of an existing backup folder ──────────────────────────
+# Does not connect to the VM. Re-hashes files against SHA256SUMS, re-runs
+# archive structure checks (tar.gz, docker image tar.gz, PostgreSQL dumps),
+# and verifies manifest.json completeness when present.
+function Invoke-BackupValidation {
+    param([Parameter(Mandatory)][string]$Folder)
+
+    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+        throw "Validate-Backup: not a directory: $Folder"
+    }
+    Write-Host ''
+    Write-Host ('=' * 78) -ForegroundColor DarkCyan
+    Write-Host "[VALIDATE] $Folder" -ForegroundColor Cyan
+    Write-Host ('=' * 78) -ForegroundColor DarkCyan
+
+    $failed = 0
+    $passed = 0
+
+    # 1. Rehash every file against SHA256SUMS
+    $sumsPath = Join-Path $Folder 'SHA256SUMS'
+    if (-not (Test-Path -LiteralPath $sumsPath -PathType Leaf)) {
+        Write-Host "  FAIL: SHA256SUMS missing — backup incomplete." -ForegroundColor Red
+        return 1
+    }
+    foreach ($line in (Get-Content -LiteralPath $sumsPath)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -notmatch '^([A-Fa-f0-9]{64})\s+\.?/?(.+)$') { continue }
+        $exp = $Matches[1].ToLowerInvariant()
+        $rel = $Matches[2].Trim()
+        if ($rel.Contains('..')) { Write-Host "  FAIL: unsafe path in SHA256SUMS: $rel" -ForegroundColor Red; $failed++; continue }
+        $win = Join-Path $Folder ($rel.Replace('/', [IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $win -PathType Leaf)) {
+            Write-Host "  FAIL: missing file: $rel" -ForegroundColor Red; $failed++; continue
+        }
+        $act = (Get-FileHash -LiteralPath $win -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($exp -ne $act) {
+            Write-Host "  FAIL: hash mismatch: $rel" -ForegroundColor Red; $failed++
+        } else {
+            $passed++
+        }
+    }
+    Write-Host "  Hash check: $passed verified, $failed failed." -ForegroundColor $(if ($failed) { 'Red' } else { 'Green' })
+
+    # 2. Re-run archive structure checks
+    foreach ($name in @('host-files.tar.gz','docker-images-all.tar.gz')) {
+        $p = Join-Path $Folder $name
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            $fmt = if ($name -eq 'docker-images-all.tar.gz') { 'docker-tar.gz' } else { 'tar.gz' }
+            try { Test-Archive -Path $p -Description $name -Format $fmt } catch { Write-Host "  FAIL: $name — $($_.Exception.Message)" -ForegroundColor Red; $failed++ }
+        } else {
+            Write-Host "  FAIL: $name not present in backup." -ForegroundColor Red; $failed++
+        }
+    }
+    $volDir = Join-Path $Folder 'volumes'
+    if (Test-Path -LiteralPath $volDir -PathType Container) {
+        foreach ($v in (Get-ChildItem -LiteralPath $volDir -Filter '*.tar.gz' -File)) {
+            try { Test-Archive -Path $v.FullName -Description "Volume: $($v.BaseName)" -Format 'tar.gz' } catch { Write-Host "  FAIL: $($v.Name)" -ForegroundColor Red; $failed++ }
+        }
+    }
+    $cluster = Join-Path $Folder 'database-dumps\postgres17-all-databases.sql'
+    if (Test-Path -LiteralPath $cluster -PathType Leaf) {
+        try { Test-Archive -Path $cluster -Description 'PostgreSQL cluster dump' -Format 'sql' } catch { Write-Host "  FAIL: cluster dump — $($_.Exception.Message)" -ForegroundColor Red; $failed++ }
+    }
+
+    # 3. Manifest completeness check (if manifest.json is present)
+    $manifestPath = Join-Path $Folder 'manifest.json'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            Write-Host "  Manifest: backupId=$($m.backupId), artifacts=$($m.artifacts.Count), volumes=$($m.volumes.Count)" -ForegroundColor Gray
+            foreach ($a in $m.artifacts) {
+                $f = Join-Path $Folder $a.path
+                if (-not (Test-Path -LiteralPath $f -PathType Leaf)) {
+                    Write-Host "  FAIL: manifest lists missing artifact: $($a.path)" -ForegroundColor Red; $failed++
+                }
+            }
+        } catch { Write-Host "  FAIL: manifest.json unreadable — $($_.Exception.Message)" -ForegroundColor Red; $failed++ }
+    } else {
+        Write-Host "  NOTE: manifest.json absent (older backup, pre-manifest format)." -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    if ($failed -eq 0) {
+        Write-Host 'VALIDATION PASSED.' -ForegroundColor Green
+        return 0
+    } else {
+        Write-Host "VALIDATION FAILED: $failed problem(s)." -ForegroundColor Red
+        return 1
+    }
+}
+
+if ($ValidateBackup) {
+    $vrc = Invoke-BackupValidation -Folder $ValidateBackup
+    exit $vrc
+}
+
+# ─── Lock file (prevents two concurrent live runs on the same BackupDir) ──────
+# Not held in DryRun mode — a dry run reads only and does not stage anything.
+$script:LockPath    = $null
+$script:LockAcquired = $false
 
 # ─── Main backup flow ─────────────────────────────────────────────────────────
 try {
     # ── Phase 1: Preflight ────────────────────────────────────────────────────
-    Write-Phase '1/9' 'Preflight: check Windows tools, create destination, connect to VM'
+    $phaseLabel = if ($DryRun) { 'DRY RUN — 1/3' } else { '1/9' }
+    Write-Phase $phaseLabel 'Preflight: check Windows tools, create destination, connect to VM'
     Write-Host "  Remote host  : $remote" -ForegroundColor Gray
     Write-Host "  Local folder : $localFolder" -ForegroundColor Gray
     Write-Host "  Compress lvl : gzip -$CompressLevel" -ForegroundColor Gray
+    if ($DryRun) { Write-Host "  Mode         : DRY RUN (no containers stopped, no archives streamed)" -ForegroundColor Yellow }
 
     if (-not (Test-Path -LiteralPath $BackupDir -PathType Container)) {
         New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
     }
-    if (Test-Path -LiteralPath $localFolder) {
-        throw "Refusing to overwrite existing restore-point folder: $localFolder"
+
+    # Acquire a BackupDir-level lock so two live runs cannot race.
+    if (-not $DryRun) {
+        $script:LockPath = Join-Path $BackupDir '.vm-full-backup.lock'
+        if (Test-Path -LiteralPath $script:LockPath -PathType Leaf) {
+            $existing = (Get-Content -LiteralPath $script:LockPath -Raw -ErrorAction SilentlyContinue).Trim()
+            $existingPid = 0
+            if ($existing -match 'PID=(\d+)') { $existingPid = [int]$Matches[1] }
+            $stillAlive = $false
+            if ($existingPid -gt 0) {
+                try { $null = Get-Process -Id $existingPid -ErrorAction Stop; $stillAlive = $true } catch { }
+            }
+            if ($stillAlive) {
+                throw "Another backup is running in $BackupDir (lock PID $existingPid). Refusing to start."
+            } else {
+                Write-Host "  Removing stale lock from PID $existingPid." -ForegroundColor Yellow
+                Remove-Item -LiteralPath $script:LockPath -Force
+            }
+        }
+        "PID=$PID`nStarted=$([DateTime]::UtcNow.ToString('o'))`nTimestamp=$timestamp" |
+            Set-Content -LiteralPath $script:LockPath -Encoding ASCII
+        $script:LockAcquired = $true
     }
-    New-Item -ItemType Directory -Path $localFolder -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $localFolder 'volumes') -Force | Out-Null
+
+    if (-not $DryRun) {
+        if (Test-Path -LiteralPath $localFolder) {
+            throw "Refusing to overwrite existing restore-point folder: $localFolder"
+        }
+        New-Item -ItemType Directory -Path $localFolder -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $localFolder 'volumes') -Force | Out-Null
+    }
 
     # Generate a disposable Ed25519 key pair.  The public key is pushed to the VM
     # in the SAME connection where the user types their password, so every subsequent
@@ -737,16 +881,26 @@ try {
     Write-Host "  Temporary SSH key installed. No further password prompts for this backup." -ForegroundColor Green
 
     # ── Phase 2: Upload runner, run prepare ───────────────────────────────────
-    Write-Phase '2/9' 'Upload runner; capture inventory and PostgreSQL dump on VM'
+    if ($DryRun) {
+        Write-Phase 'DRY RUN — 2/3' 'Upload runner (prepare skipped — no PostgreSQL dump, no inventory capture)'
+    } else {
+        Write-Phase '2/9' 'Upload runner; capture inventory and PostgreSQL dump on VM'
+    }
     Invoke-NativeChecked -FilePath $scpExe `
         -ArgumentList ($script:ScpCtrlOpts + @($tempScript, "${remote}:$remoteRunnerPath")) `
         -Action 'Upload remote backup runner'
-    Invoke-NativeChecked -FilePath $script:SshExe `
-        -ArgumentList (@('-t', $remote) + $script:SshOpts + @("bash '$remoteRunnerPath' prepare '$backupFolderName' '$timestamp'")) `
-        -Action 'Prepare staging dir / inventory / DB dump'
+    if (-not $DryRun) {
+        Invoke-NativeChecked -FilePath $script:SshExe `
+            -ArgumentList (@('-t', $remote) + $script:SshOpts + @("bash '$remoteRunnerPath' prepare '$backupFolderName' '$timestamp'")) `
+            -Action 'Prepare staging dir / inventory / DB dump'
+    }
 
     # ── Phase 3: Get stream info, check disk, ask confirmation ────────────────
-    Write-Phase '3/9' 'Collect volume list, size estimates, confirm downtime'
+    if ($DryRun) {
+        Write-Phase 'DRY RUN — 3/3' 'Collect volume list and size estimates (read-only)'
+    } else {
+        Write-Phase '3/9' 'Collect volume list, size estimates, confirm downtime'
+    }
     $infoLines = Invoke-SshText -Remote $remote `
         -Command "bash '$remoteRunnerPath' get-info '$backupFolderName'" `
         -Action 'Get stream info'
@@ -787,6 +941,36 @@ try {
     Write-Host ''
     Write-Host "  STREAMING ARCHITECTURE: archives are streamed directly from the VM to Windows." -ForegroundColor Cyan
     Write-Host "  The VM does NOT need disk space for the large image or volume archives." -ForegroundColor Cyan
+
+    # Volume breakdown (useful in dry-run and before confirmation)
+    if ($volumeInfo.Count -gt 0) {
+        Write-Host ''
+        Write-Host "  Volume inventory (uncompressed estimates):" -ForegroundColor Gray
+        $volTotal = [long]0
+        foreach ($v in $volumeInfo) {
+            Write-Host ("    {0,-55} {1,10}" -f $v.Name, (Format-ByteSize $v.EstBytes)) -ForegroundColor Gray
+            $volTotal += $v.EstBytes
+        }
+        Write-Host ("    {0,-55} {1,10}" -f 'TOTAL', (Format-ByteSize $volTotal)) -ForegroundColor Gray
+    }
+
+    if ($DryRun) {
+        Write-Host ''
+        Write-Host ('─' * 78) -ForegroundColor Green
+        Write-Host "DRY RUN COMPLETE — no changes made to the VM." -ForegroundColor Green
+        Write-Host "  VM free disk     : $vmFreeGB GiB" -ForegroundColor Green
+        Write-Host "  Volumes          : $($volumeInfo.Count)" -ForegroundColor Green
+        Write-Host "  Images           : $imageCount" -ForegroundColor Green
+        Write-Host "  Host files est   : $(Format-ByteSize $hostFilesEst)" -ForegroundColor Green
+        Write-Host "  Rerun without -DryRun to perform the backup." -ForegroundColor Green
+        Write-Host ('─' * 78) -ForegroundColor Green
+        # Remove the uploaded runner so the VM has no leftover from this dry run.
+        try {
+            & $script:SshExe @script:SshOpts $remote "rm -f '$remoteRunnerPath'" 2>&1 | Out-Null
+        } catch { Write-Warning "Could not remove $remoteRunnerPath from VM: $($_.Exception.Message)" }
+        exit 0
+    }
+
     Write-Host ''
     Write-Host "  The backup will briefly stop all running containers to ensure volume consistency," -ForegroundColor Yellow
     Write-Host "  then restart them. Container snapshots and Docker images are captured afterward." -ForegroundColor Yellow
@@ -814,6 +998,14 @@ try {
         -EstimatedBytes $hostFilesEst `
         -Label "4/9"
     $windowsChecksums.Add("$($hfResult.Hash)  ./host-files.tar.gz")
+    $manifestArtifacts.Add(@{
+        path         = 'host-files.tar.gz'
+        kind         = 'host-files'
+        bytes        = $hfResult.Bytes
+        sourceSha256 = $hfResult.SourceHash
+        destSha256   = $hfResult.Hash
+        verified     = ($hfResult.SourceHash -eq $hfResult.Hash)
+    })
 
     # Stream each volume
     $volIdx = 0
@@ -832,6 +1024,16 @@ try {
             -EstimatedBytes $vEst `
             -Label "$volIdx+hf/$($volumeInfo.Count+1) vol"
         $windowsChecksums.Add("$($vResult.Hash)  ./volumes/$vFile.tar.gz")
+        $manifestArtifacts.Add(@{
+            path         = "volumes/$vFile.tar.gz"
+            kind         = 'volume'
+            volumeName   = $vName
+            estBytes     = $vEst
+            bytes        = $vResult.Bytes
+            sourceSha256 = $vResult.SourceHash
+            destSha256   = $vResult.Hash
+            verified     = ($vResult.SourceHash -eq $vResult.Hash)
+        })
     }
 
     # ── Phase 5: Snapshot containers (while stopped), then restart ────────────
@@ -861,6 +1063,15 @@ try {
         -Description 'All Docker images + container snapshots' `
         -Label '6/9'
     $windowsChecksums.Add("$($imgResult.Hash)  ./docker-images-all.tar.gz")
+    $manifestArtifacts.Add(@{
+        path         = 'docker-images-all.tar.gz'
+        kind         = 'docker-images'
+        imageCount   = $imageCount
+        bytes        = $imgResult.Bytes
+        sourceSha256 = $imgResult.SourceHash
+        destSha256   = $imgResult.Hash
+        verified     = ($imgResult.SourceHash -eq $imgResult.Hash)
+    })
 
     # ── Phase 7: Finalize VM staging; SCP small files ─────────────────────────
     Write-Phase '7/9' 'Finalize VM staging dir; transfer reports/logs/DB dumps via SCP'
@@ -898,9 +1109,11 @@ try {
     }
 
     # Validate DB dumps
+    $clusterDumpStatus = 'absent'
     $clusterDump = Join-Path $localFolder 'database-dumps\postgres17-all-databases.sql'
     if (Test-Path -LiteralPath $clusterDump -PathType Leaf) {
-        Test-Archive -Path $clusterDump -Description 'PostgreSQL cluster dump' -Format 'sql'
+        try { Test-Archive -Path $clusterDump -Description 'PostgreSQL cluster dump' -Format 'sql'; $clusterDumpStatus = 'validated' }
+        catch { $clusterDumpStatus = 'invalid'; throw }
     }
     $customDumps = @(Get-ChildItem -LiteralPath (Join-Path $localFolder 'database-dumps') -Filter '*-custom.dump' -File -ErrorAction SilentlyContinue)
     foreach ($cd in $customDumps) {
@@ -975,6 +1188,50 @@ IMPORTANT
 "@
     $infoContent | Set-Content -LiteralPath (Join-Path $localFolder 'BACKUP-INFO.txt') -Encoding UTF8
 
+    # Machine-readable manifest for later validation and tooling. The .txt
+    # above is for humans; this is the source of truth for -ValidateBackup.
+    # Written without the PS7 ternary so this parses on Windows PowerShell 5.1.
+    $artList = foreach ($a in $manifestArtifacts) {
+        $o = [ordered]@{
+            path         = $a.path
+            kind         = $a.kind
+            bytes        = $a.bytes
+            sourceSha256 = $a.sourceSha256
+            destSha256   = $a.destSha256
+            verified     = [bool]$a.verified
+        }
+        if ($a.ContainsKey('volumeName')) { $o.volumeName = $a.volumeName }
+        if ($a.ContainsKey('estBytes'))   { $o.estBytes   = $a.estBytes }
+        if ($a.ContainsKey('imageCount')) { $o.imageCount = $a.imageCount }
+        $o
+    }
+    $allVerified = ($manifestArtifacts | Where-Object { -not $_.verified } | Measure-Object).Count -eq 0
+    $manifest = [ordered]@{
+        schemaVersion      = 1
+        backupId           = $backupFolderName
+        createdUtc         = $createdUtc
+        source             = [ordered]@{
+            sshHost  = $SshHost
+            sshUser  = $SshUser
+            stackDir = '/opt/n8n-docker-caddy'
+        }
+        compressLevel      = $CompressLevel
+        architecture       = 'direct-ssh-stream'
+        artifacts          = @($artList)
+        volumes            = @($volumeInfo | ForEach-Object { [ordered]@{ name = $_.Name; estBytes = $_.EstBytes } })
+        imageCount         = $imageCount
+        stoppedContainerIds = @($stoppedIds)
+        verification       = [ordered]@{
+            streamHashesMatched   = $allVerified
+            archiveStructureValid = $true
+            clusterDumpStatus     = $clusterDumpStatus
+            customDumpsFound      = $customDumps.Count
+            smallFilesChecksCount = $smallChecks
+        }
+    }
+    ($manifest | ConvertTo-Json -Depth 8) |
+        Set-Content -LiteralPath (Join-Path $localFolder 'manifest.json') -Encoding UTF8
+
     # ── Phase 9: Clean up remote staging dir ──────────────────────────────────
     Write-Phase '9/9' 'Clean up VM staging directory (originals retained)'
     try {
@@ -1018,5 +1275,9 @@ finally {
     }
     if ($tempScript -and (Test-Path -LiteralPath $tempScript)) {
         Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+    }
+    # Release the BackupDir lock last — nothing above it needs the lock.
+    if ($script:LockAcquired -and $script:LockPath -and (Test-Path -LiteralPath $script:LockPath -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $script:LockPath -Force -ErrorAction SilentlyContinue
     }
 }
