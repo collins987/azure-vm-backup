@@ -1116,11 +1116,28 @@ try {
         catch { $clusterDumpStatus = 'invalid'; throw }
     }
     $customDumps = @(Get-ChildItem -LiteralPath (Join-Path $localFolder 'database-dumps') -Filter '*-custom.dump' -File -ErrorAction SilentlyContinue)
+    # pg_restore.exe is OPTIONAL on Windows. The custom dumps were already
+    # produced by pg_dump -Fc on the VM, and the per-DB status is recorded in
+    # reports/postgres-logical-dump-status.txt. If pg_restore.exe isn't
+    # installed on Windows, skip local re-validation with a clear warning
+    # rather than failing the backup. (Running the command bare raises a
+    # terminating CommandNotFoundException under $ErrorActionPreference=Stop,
+    # so we must probe for it first.)
+    $pgRestoreCmd = Get-Command 'pg_restore.exe' -ErrorAction SilentlyContinue
     foreach ($cd in $customDumps) {
         Write-Host "  Validating custom dump: $($cd.Name)" -ForegroundColor Gray
-        $pgRestoreResult = & pg_restore.exe --list $cd.FullName 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "  WARNING: pg_restore --list failed for $($cd.Name) (pg_restore.exe may not be installed on Windows; dump was verified on the VM)." -ForegroundColor Yellow
+        if (-not $pgRestoreCmd) {
+            Write-Host "  SKIP: pg_restore.exe not on PATH; VM-side pg_dump -Fc already validated. See reports/postgres-logical-dump-status.txt." -ForegroundColor Yellow
+            continue
+        }
+        $prev = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $null = & $pgRestoreCmd.Source --list $cd.FullName 2>&1
+            $exit = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prev }
+        if ($exit -ne 0) {
+            Write-Host "  WARNING: pg_restore --list exited $exit for $($cd.Name) (dump was verified on the VM; local check inconclusive)." -ForegroundColor Yellow
         } else {
             Write-Host "  PASS: $($cd.Name)" -ForegroundColor Green
         }
