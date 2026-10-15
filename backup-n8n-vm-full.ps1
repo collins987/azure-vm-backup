@@ -406,17 +406,18 @@ mode_get_info() {
     # Volumes
     local -a vnames=()
     mapfile -t vnames < <(docker volume ls -q)
-    # Volume mountpoints live under /var/lib/docker/volumes/<name>/_data and
-    # are owned by root, so an unprivileged du returns 0. Use sudo (the backup
-    # already relies on sudo tar for host files, so the same NOPASSWD rule
-    # applies). If sudo du happens to fail, fall back to the unprivileged read
-    # rather than aborting the discovery pass.
+    # Volume mountpoints live under /var/lib/docker/volumes/, which on most
+    # Docker installations is mode 700 owned by root. That blocks both the
+    # bash `[[ -d $mp ]]` test (can't stat into the parent) AND an
+    # unprivileged du. Skip the local directory test and go straight to
+    # `sudo -n du` — the backup already relies on NOPASSWD sudo for tar so
+    # the same grant applies. If every path we have fails, size falls back
+    # to 0 (purely cosmetic — the archives themselves don't need this).
     for v in "${vnames[@]}"; do
         local mp sz=0
         mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null || true)"
-        if [[ -d "$mp" ]]; then
+        if [[ -n "$mp" ]]; then
             sz="$(sudo -n du -sb "$mp" 2>/dev/null | awk '{print $1}')"
-            [[ -z "$sz" ]] && sz="$(du -sb "$mp" 2>/dev/null | awk '{print $1}')"
             [[ -z "$sz" ]] && sz=0
         fi
         printf 'VOLUME:%s:%s\n' "$v" "$sz"
