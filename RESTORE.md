@@ -9,6 +9,34 @@ credentials decryptable.
 
 ---
 
+## 0. One-command path (`restore-n8n-vm-full.sh`)
+
+For a fresh target VM, the whole flow in sections 2-8 below is wrapped by
+one script: `restore-n8n-vm-full.sh`. It runs all preflight checks, verifies
+`SHA256SUMS` end-to-end (handles the UTF-8 BOM / CRLF that Windows PS 5.1
+writes), refuses to run against a VM that has the stack already running,
+extracts host files at their original paths, confirms `N8N_ENCRYPTION_KEY` is
+present, loads images, restores every volume by name, and starts
+`/opt/n8n-docker-caddy` plus Firecrawl's compose if one exists.
+
+```bash
+# on the target VM, after SCP'ing the backup folder:
+scp restore-n8n-vm-full.sh n8nuser@TARGET_VM:/home/n8nuser/
+ssh n8nuser@TARGET_VM
+bash restore-n8n-vm-full.sh /tmp/VM-Restore-Point-20261015-200746
+```
+
+Flags: `--no-start` (extract everything but skip `docker compose up`),
+`--skip-hash-check` (if you already ran Windows-side `-ValidateBackup`
+against the same folder), `--assume-yes` (skip the confirmation prompt on
+known-fresh VMs).
+
+If you prefer to run the steps by hand — because you want to inspect
+intermediate state, or you're restoring on top of partial state — follow
+sections 1-9 below instead.
+
+---
+
 ## 1. Verify the backup before you touch any VM
 
 Run the offline validator from Windows. It does not need network access

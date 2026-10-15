@@ -3,11 +3,14 @@ FULL VM / DOCKER RESTORE-POINT BACKUP — WINDOWS CMD
 Architecture: direct SSH streaming (no large staging files on VM)
 
 FILES
-  backup-n8n-vm-full.cmd   Launch this from Windows Explorer or CMD.
-  backup-n8n-vm-full.ps1   Drives the backup over SSH from Windows.
-  RESTORE.md               Step-by-step restore runbook.
-  CLAUDE.md                Context for future automated edits to this repo.
-  tests/syntax-check.sh    Static bash-syntax check of the embedded runner.
+  backup-n8n-vm-full.cmd    Launch this from Windows Explorer or CMD.
+  backup-n8n-vm-full.ps1    Drives the backup over SSH from Windows.
+  restore-n8n-vm-full.sh    One-command restore script. Run on the TARGET
+                            Ubuntu VM, with the backup folder already SCP'd
+                            onto it. See RESTORE.md section 0.
+  RESTORE.md                Step-by-step restore runbook.
+  CLAUDE.md                 Context for future automated edits to this repo.
+  tests/syntax-check.sh     Static bash-syntax check of the embedded runner.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PREREQUISITES
