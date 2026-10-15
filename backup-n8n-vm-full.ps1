@@ -406,11 +406,18 @@ mode_get_info() {
     # Volumes
     local -a vnames=()
     mapfile -t vnames < <(docker volume ls -q)
+    # Volume mountpoints live under /var/lib/docker/volumes/<name>/_data and
+    # are owned by root, so an unprivileged du returns 0. Use sudo (the backup
+    # already relies on sudo tar for host files, so the same NOPASSWD rule
+    # applies). If sudo du happens to fail, fall back to the unprivileged read
+    # rather than aborting the discovery pass.
     for v in "${vnames[@]}"; do
         local mp sz=0
         mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null || true)"
         if [[ -d "$mp" ]]; then
-            sz="$(du -sb "$mp" 2>/dev/null | awk '{print $1}' || echo 0)"
+            sz="$(sudo -n du -sb "$mp" 2>/dev/null | awk '{print $1}')"
+            [[ -z "$sz" ]] && sz="$(du -sb "$mp" 2>/dev/null | awk '{print $1}')"
+            [[ -z "$sz" ]] && sz=0
         fi
         printf 'VOLUME:%s:%s\n' "$v" "$sz"
     done
